@@ -42,3 +42,9 @@ transformers
 huggingface-hub
 streamlit_folium
 langchain_community
+streamlit
+streamlit-folium
+folium
+google-generativeai
+geopy
+python-dotenv
