@@ -48,3 +48,4 @@ folium
 google-generativeai
 geopy
 python-dotenv
+tf-keras
