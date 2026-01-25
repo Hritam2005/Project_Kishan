@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import sys
 import numpy as np
 import json
 import requests
@@ -23,7 +24,19 @@ from streamlit_mic_recorder import mic_recorder
 import speech_recognition as sr
 from gtts import gTTS
 import io
+from streamlit_js_eval import get_geolocation
 warnings.filterwarnings('ignore')
+
+# PATCH: Map numpy 2.0 internal structure to numpy 1.x
+# This tricks the pickle loader into finding the "missing" module
+try:
+    import numpy._core.multiarray
+except ImportError:
+    # If we are on NumPy 1.x but the model wants 2.0:
+    # We create a fake _core module that points to the old core
+    from types import ModuleType
+    sys.modules["numpy._core"] = sys.modules["numpy.core"]
+    sys.modules["numpy._core.multiarray"] = sys.modules["numpy.core.multiarray"]
 
 # Load environment variables
 load_dotenv()
@@ -330,23 +343,33 @@ class ProjectKishan:
         self.setup_rag()
 
     def setup_rag(self):
-        """Load the pre-computed Local Knowledge Base"""
+        """Load RAG using a path relative to this script file"""
+        print("🔍 Attempting to load RAG...")
         try:
-            # Use the SAME model as ingestion
+            from langchain_community.embeddings import HuggingFaceEmbeddings
             embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
             
-            if os.path.exists("faiss_index"):
+            # --- THE FIX: Get the absolute path of the script's folder (src/) ---
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            index_path = os.path.join(script_dir, "faiss_index")
+            
+            # Check the constructed path
+            if os.path.exists(index_path):
                 self.vector_store = FAISS.load_local(
-                    "faiss_index", 
+                    index_path, 
                     embeddings, 
                     allow_dangerous_deserialization=True
                 )
                 self.api_status['rag'] = True
+                print(f"✅ RAG Loaded from: {index_path}")
             else:
                 self.api_status['rag'] = False
+                # Print where we looked so you can debug
+                st.error(f"❌ RAG Error: Folder not found at {index_path}")
+                
         except Exception as e:
-            # print(f"RAG Error: {e}") # Debug only
             self.api_status['rag'] = False
+            st.error(f"❌ RAG Crashed: {str(e)}")
 
     def get_grounded_context(self, user_query):
         """Retrieve relevant chunks from PDFs"""
@@ -397,43 +420,65 @@ class ProjectKishan:
             self.api_status['weather'] = True
     
     def initialize_gee(self):
-        """
-        Initializes GEE using a simplified approach with service account or manual authentication.
-        """
+        """Initializes GEE using a Secret Key (Service Account) with Correct Scopes"""
         try:
-            # Try service account authentication first
-            service_account = os.getenv('GEE_SERVICE_ACCOUNT')
-            private_key_path = os.getenv('GEE_PRIVATE_KEY_PATH')
+            # 1. Check if the secret exists
+            key_content = os.getenv('GEE_KEY_JSON')
+            if not key_content:
+                st.error("❌ GEE Error: Secret 'GEE_KEY_JSON' is missing.")
+                return False
+
+            # 2. Parse the JSON
+            try:
+                service_account_info = json.loads(key_content)
+            except json.JSONDecodeError:
+                st.error("❌ GEE Error: Secret 'GEE_KEY_JSON' is not valid JSON.")
+                return False
+
+            # 3. Authenticate with SCOPES (This is the fix)
+            from google.oauth2.service_account import Credentials
             
-            if service_account and private_key_path and os.path.exists(private_key_path):
-                credentials = ee.ServiceAccountCredentials(service_account, private_key_path)
-                ee.Initialize(credentials, project=os.getenv('GEE_PROJECT_ID'))
-                print("✅ GEE Initialized with Service Account")
-                return True
-            else:
-                # Try to initialize with existing credentials
-                ee.Initialize(project=os.getenv('GEE_PROJECT_ID'))
-                print("✅ GEE Initialized with Default Credentials")
-                return True
+            # Define the specific permission Earth Engine needs
+            scopes = ['https://www.googleapis.com/auth/earthengine']
+            
+            # Create credentials with that scope
+            creds = Credentials.from_service_account_info(
+                service_account_info, 
+                scopes=scopes
+            )
+            
+            # Initialize Earth Engine with specific project
+            # (Use the project_id from the JSON file to be safe)
+            project_id = service_account_info.get('project_id')
+            ee.Initialize(credentials=creds, project=project_id)
+            
+            print(f"✅ GEE Initialized successfully for project: {project_id}")
+            return True
+
         except Exception as e:
-            print(f"❌ GEE Initialization Failed: {str(e)}")
-            print(f"   - Service Account: {os.getenv('GEE_SERVICE_ACCOUNT', 'NOT SET')}")
-            print(f"   - Key Path: {os.getenv('GEE_PRIVATE_KEY_PATH', 'NOT SET')}")
-            print(f"   - Project ID: {os.getenv('GEE_PROJECT_ID', 'NOT SET')}")
+            st.error(f"❌ GEE Authentication Failed: {str(e)}")
             return False
     
     def load_ml_model(self):
         """
-        Loads the 'Smart Pipeline' model. 
-        Everything (encoding, scaling, prediction) is now in one file.
+        Robust Loader: Tries to load the file. 
+        If version mismatch (pickle error) happens, it Auto-Retrains on the server.
         """
         try:
             self.model = joblib.load('models/best_model.pkl')
             self.api_status['model'] = True
-            print("✅ AI Model Loaded Successfully (R²=0.92)")
+            print("✅ AI Model Loaded Successfully")
         except Exception as e:
-            self.api_status['model'] = False
-            print(f"❌ Model Loading Failed: {e}")
+            print(f"⚠️ Model load failed ({e}). Auto-repairing...")
+            try:
+                # Dynamically import and run the repair script
+                import retrain_model
+                self.model = retrain_model.train_and_save()
+                self.api_status['model'] = True
+                print("✅ Model repaired and loaded!")
+            except Exception as repair_error:
+                self.api_status['model'] = False
+                print(f"❌ Critical Error: Repair failed. {repair_error}")
 
     def is_farmland_area(self, latitude, longitude):
         """
@@ -986,13 +1031,29 @@ def main():
     if 'Kishan' not in st.session_state:
         st.session_state.Kishan = ProjectKishan()
         st.session_state.chat_history = []
-        # Default start location
+        # Default start location (Fallback: Bankura)
         st.session_state.current_location = {"lat": 23.2715, "lon": 87.3095} 
         st.session_state.current_analysis = None
         st.session_state.selected_crop = 'Rice'
-    
+        st.session_state.auto_analyzed = False # Track if we have done the first auto-run
+
     Kishan = st.session_state.Kishan
-    
+
+    # --- GEOLOCATION LOGIC (The New Feature) ---
+    # This runs on every refresh. It returns None until the user clicks "Allow".
+    user_loc = get_geolocation(component_key="get_user_location_unique")
+
+    # Check if we have received new coordinates from the browser AND haven't synced yet
+    if user_loc and 'geo_synced' not in st.session_state:
+        new_lat = user_loc['coords']['latitude']
+        new_lon = user_loc['coords']['longitude']
+        
+        # Update State
+        st.session_state.current_location = {"lat": new_lat, "lon": new_lon}
+        st.session_state.geo_synced = True  # Mark as synced so we don't reset it
+        st.session_state.trigger_analysis = True # Flag to force analysis
+        st.rerun() # Refresh the app immediately to show the new location
+
     # --- 2. SIDEBAR PART 1 (Language & Title) ---
     with st.sidebar:
         # A. LANGUAGE SELECTOR
@@ -1012,44 +1073,35 @@ def main():
     st.markdown(contact_html, unsafe_allow_html=True)
     
     # --- 4. MAP & ANALYSIS SECTION (FULL WIDTH) ---
-    # We do NOT use columns here so the map stays wide.
-    # LOGIC ORDER: This runs FIRST to update state before sidebar widgets are drawn.
-    
     st.markdown('<div class="center-wrapper">', unsafe_allow_html=True)
-
-    # Display Interactive Map using state coordinates
+    
+    # Display Interactive Map using state coordinates (Now Dynamic!)
     map_obj = create_interactive_map(
         st.session_state.current_location["lat"],
         st.session_state.current_location["lon"]
     )
-    # Height adjusted slightly to match your preference
+    
     map_data = st_folium(map_obj, width=None, height=420, returned_objects=["last_clicked"])
 
-    # HANDLE MAP CLICKS (The Sync Logic)
+    # HANDLE MAP CLICKS
     if map_data and map_data.get("last_clicked"):
         clicked_lat = map_data["last_clicked"]["lat"]
         clicked_lng = map_data["last_clicked"]["lng"]
-
-        # Get current stored location
+        
         current_lat = st.session_state.current_location["lat"]
         current_lng = st.session_state.current_location["lon"]
-
+        
         # Check if new click (tolerance ~11 meters)
         if abs(clicked_lat - current_lat) > 0.0001 or abs(clicked_lng - current_lng) > 0.0001:
-            # 1. Update Main State
             st.session_state.current_location = {"lat": clicked_lat, "lon": clicked_lng}
-            # 2. Update widget state (Safe here because widgets aren't drawn yet)
             st.session_state["lat_input_box"] = clicked_lat
             st.session_state["lon_input_box"] = clicked_lng
-            # 3. Rerun to refresh the view
             st.rerun()
-    
+
     st.markdown('</div>', unsafe_allow_html=True)
 
     # --- 5. SIDEBAR PART 2 (INPUTS) ---
-    # Now that the map logic is done, we can safely draw the sidebar inputs.
     with st.sidebar:
-        # Callback to sync manual typing to state
         def update_location_from_input():
             st.session_state.current_location["lat"] = st.session_state.lat_input_box
             st.session_state.current_location["lon"] = st.session_state.lon_input_box
@@ -1074,8 +1126,8 @@ def main():
         available_crops = [
             'Rice', 'Wheat', 'Maize', 'Sugarcane', 'Cotton', 'Coffee', 'Tea', 
             'Soybean', 'Barley', 'Sorghum', 'Millets', 'Pulses', 'Oil Palm',
-            'Groundnut', 'Sunflower', 'Coconut', 'Cashew Nut',
-             'Turmeric', 'Ginger', 'Tobacco', 'Rubber'
+            'Groundnut', 'Sunflower', 'Coconut', 'Cashew Nut', 
+            'Turmeric', 'Ginger', 'Tobacco', 'Rubber'
         ]
         
         crop_type = st.selectbox(t["select_crop"], available_crops, key="crop_select")
@@ -1092,30 +1144,38 @@ def main():
             st.write(f"{status_icon(Kishan.api_status['weather'])} Weather")
             st.write(f"{status_icon(Kishan.api_status['gemini'])} Gemini")
 
-    # --- 6. ANALYZE BUTTON (FULL WIDTH) ---
-    # This renders below the map in the main flow
+    # --- 6. ANALYZE LOGIC (Button OR Auto-Run) ---
     st.markdown('<div class="center-button">', unsafe_allow_html=True)
 
-    # Try to display farmer illustration if available
-    for _p in ("assets/farmer.png", "farmer.png", "static/farmer.png"):
-        if os.path.exists(_p):
-            st.image(_p, width=140)
-            break
-
+    # Check for missing APIs
     required_apis = ['model']
     missing_apis = [api for api in required_apis if not Kishan.api_status[api]]
     analyze_disabled = bool(missing_apis)
     if missing_apis:
         st.error(f"❌ API Error: {', '.join(missing_apis)}")
 
-    if st.button(t["analyze_btn"], type="primary", use_container_width=True, disabled=analyze_disabled):
+    # LOGIC: Did user click button? OR Is auto-trigger set?
+    user_clicked = st.button(t["analyze_btn"], type="primary", use_container_width=True, disabled=analyze_disabled)
+    auto_trigger = st.session_state.get('trigger_analysis', False)
+
+    # If this is the FIRST run and we haven't analyzed yet, do it now (fallback for default location)
+    if not st.session_state.auto_analyzed and not st.session_state.current_analysis:
+        auto_trigger = True
+
+    if (user_clicked or auto_trigger) and not analyze_disabled:
+        # Reset the trigger so it doesn't loop
+        st.session_state.trigger_analysis = False 
+        st.session_state.auto_analyzed = True
+        
         with st.spinner(t["analyzing"]):
             try:
                 lat = st.session_state.current_location["lat"]
                 lon = st.session_state.current_location["lon"]
+                
                 satellite_data, _ = Kishan.get_satellite_data(lat, lon)
                 weather_data, _ = Kishan.get_weather_forecast(lat, lon)
                 prediction, _ = Kishan.predict_yield(lat, lon, satellite_data, weather_data, crop_type)
+                
                 st.session_state.current_analysis = {
                     'latitude': lat, 'longitude': lon, 'crop_type': crop_type,
                     'analysis_date': datetime.now().strftime('%Y-%m-%d %H:%M'),
@@ -1131,6 +1191,7 @@ def main():
                     'weather_data': weather_data
                 }
                 st.success("✅ Analysis Complete!")
+                
             except Exception as e:
                 st.error(f"❌ Analysis failed: {str(e)}")
                 st.session_state.current_analysis = None
@@ -1168,7 +1229,7 @@ def main():
                     <p>tons/ha</p>
                 </div>
                 """, unsafe_allow_html=True)
-                
+
             with m_col3: # SOIL
                 sm_val = analysis['soil_moisture']
                 sm_status_key = "status_optimal" if 20 <= sm_val <= 60 else "status_dry" if sm_val < 20 else "status_wet"
@@ -1180,7 +1241,7 @@ def main():
                     <p>{sm_status_text}</p>
                 </div>
                 """, unsafe_allow_html=True)
-                
+
             with m_col4: # RAIN
                 st.markdown(f"""
                 <div class="metric-card-box bg-rain">
@@ -1212,8 +1273,8 @@ def main():
             
             if Kishan.api_status['gemini']:
                 insight_key = f"insight_{analysis['latitude']}_{analysis['crop_type']}_{selected_lang}_{analysis['analysis_date']}"
-                if insight_key not in st.session_state:
-                     with st.spinner("Generating insights..."):
+                if insight_key not in st.session_state: 
+                    with st.spinner("Generating insights..."):
                         initial_prompt = "Provide a 3-sentence summary of the farm health and one key recommendation."
                         st.session_state[insight_key] = Kishan.generate_ai_response(
                             initial_prompt, analysis, language_instruction=t["prompt_instruction"]
@@ -1234,7 +1295,6 @@ def main():
                 role_display = "👤 You" if message['role'] == 'user' else f"🤖 {t['title']}"
                 with st.chat_message(message['role']):
                     st.write(message['content'])
-                    # If this is an assistant message and has audio, play it
                     if message.get('audio'):
                         st.audio(message['audio'], format='audio/mp3')
 
@@ -1242,41 +1302,34 @@ def main():
             st.markdown("---")
             c1, c2 = st.columns([1, 8])
             
-            # VOICE RECORDER BUTTON
             with c1:
                 st.write("🎙️")
-                # This records audio and returns the bytes
                 audio_input = mic_recorder(
                     start_prompt="Rec",
                     stop_prompt="Stop",
                     key='recorder',
-                    format="wav",  # Important for SpeechRecognition
+                    format="wav",
                     use_container_width=True
                 )
 
             # 3. Handle Voice Input OR Text Input
             user_text = None
             
-            # CHECK: Did user speak?
             if audio_input and audio_input['bytes']:
-                # Transcribe the audio
                 transcribed_text = recognize_audio(audio_input['bytes'], selected_lang)
                 if transcribed_text:
                     user_text = transcribed_text
-            
-            # CHECK: Did user type?
+
             if prompt := st.chat_input(t["chat_placeholder"]):
                 user_text = prompt
 
-            # 4. Process the Input (Voice or Text)
+            # 4. Process Input
             if user_text:
-                # Add User Message to Chat
                 st.session_state.chat_history.append({'role': 'user', 'content': user_text})
                 st.chat_message("user").write(user_text)
                 
                 with st.spinner("Thinking & Speaking..."):
                     try:
-                        # Get AI Text Response
                         ai_response_text = Kishan.generate_ai_response(
                             user_text,
                             st.session_state.current_analysis,
@@ -1284,24 +1337,24 @@ def main():
                             language_instruction=t["prompt_instruction"]
                         )
                         
-                        # Generate Audio for the Response
                         audio_response = speak_text(ai_response_text, selected_lang)
                         
-                        # Save to history with audio
                         st.session_state.chat_history.append({
                             'role': 'assistant', 
                             'content': ai_response_text,
                             'audio': audio_response
                         })
                         
-                        # Display AI Response immediately
                         with st.chat_message("assistant"):
                             st.write(ai_response_text)
                             if audio_response:
                                 st.audio(audio_response, format='audio/mp3', start_time=0)
-                                
+
+                        st.rerun()
+                            
                     except Exception as e:
                         st.error(f"AI Error: {str(e)}")
 
 if __name__ == "__main__":
     main()
+
