@@ -379,39 +379,64 @@ class ProjectKishan:
         return "", []
         
     def initialize_apis(self):
-        """Initialize all required APIs with robust error handling"""
-        # Initialize Gemini AI
+        """Initialize all required APIs with key rotation and robust error handling"""
+        
+        # --- 1. Initialize Gemini AI (with Key Rotation) ---
         try:
-            gemini_key = os.getenv('GEMINI_API_KEY')
-            if not gemini_key or gemini_key == 'your-gemini-api-key-here':
+            # Load ALL keys starting with GEMINI_API_KEY*
+            self.gemini_keys = [
+                val for key, val in os.environ.items() 
+                if key.startswith("GEMINI_API_KEY") and val != 'your-gemini-api-key-here'
+            ]
+            
+            # Fallback: If no keys found via startswith, look for specific single key
+            if not self.gemini_keys:
+                single_key = os.getenv('GEMINI_API_KEY')
+                if single_key and single_key != 'your-gemini-api-key-here':
+                    self.gemini_keys = [single_key]
+            
+            if not self.gemini_keys:
+                print("❌ No Gemini API keys found.")
                 self.api_status['gemini'] = False
             else:
-                genai.configure(api_key=gemini_key)
+                # Test the keys to confirm at least one works
+                import random
+                test_key = random.choice(self.gemini_keys)
+                genai.configure(api_key=test_key)
                 
-                # Try different model names
-                model_priority = ['gemini-2.5-pro', 'gemini-2.5-flash']
+                # Priority: Try Flash first (faster/higher limits), then Pro
+                model_priority = ['gemini-2.5-flash', 'gemini-1.5-pro']
                 
                 successful_model = None
                 for model_name in model_priority:
                     try:
-                        self.gemini_model = genai.GenerativeModel(model_name)
-                        test_response = self.gemini_model.generate_content("Test")
+                        # We just store the model NAME now, not the object
+                        # (The object needs re-init with new keys during rotation)
+                        self.gemini_model_name = model_name
+                        
+                        # Test connection
+                        test_model = genai.GenerativeModel(model_name)
+                        test_model.generate_content("Test connection")
+                        
                         successful_model = model_name
                         self.api_status['gemini'] = True
+                        print(f"✅ Gemini initialized with model: {model_name}")
                         break
                     except Exception as model_error:
+                        print(f"⚠️ Model {model_name} failed: {model_error}")
                         continue
                 
                 if not successful_model:
                     self.api_status['gemini'] = False
-                    
+
         except Exception as e:
+            print(f"❌ Gemini Init Error: {e}")
             self.api_status['gemini'] = False
-        
-        # Initialize GEE
+
+        # --- 2. Initialize GEE ---
         self.api_status['gee'] = self.initialize_gee()
         
-        # Check OpenWeatherMap API key
+        # --- 3. Check OpenWeatherMap API key ---
         weather_key = os.getenv('OPENWEATHER_API_KEY')
         if not weather_key or weather_key == 'your-openweather-api-key-here':
             self.api_status['weather'] = False
@@ -908,29 +933,29 @@ class ProjectKishan:
     
     def generate_ai_response(self, user_prompt, analysis_context, chat_history=[], language_instruction="Answer in English"):
         """
-        FULL POWER: RAG (Books) + Satellite (Data) + Multilingual (Voice)
+        FULL POWER: RAG (Books) + Satellite (Data) + Multilingual (Voice) + KEY ROTATION
         """
-        if not self.api_status['gemini']:
-            return "AI service is currently unavailable."
+        import random
+        import time
+        import google.generativeai as genai
+        from google.api_core.exceptions import ResourceExhausted
 
-        # --- 1. RAG RETRIEVAL (The Missing Link) ---
+        # --- 1. RAG RETRIEVAL ---
         rag_context = ""
         sources_used = []
         
         if self.api_status['rag']:
             try:
-                # Search for 3 relevant chunks from your PDF database
                 docs = self.vector_store.similarity_search(user_prompt, k=3)
                 for doc in docs:
                     rag_context += f"- {doc.page_content}\n"
-                    # Capture the source filename for citation
                     source = doc.metadata.get('source', 'Unknown File')
                     if source not in sources_used:
                         sources_used.append(source)
             except Exception as e:
                 print(f"RAG Error: {e}")
                 rag_context = "No knowledge base context available."
-        
+
         # --- 2. PROMPT CONSTRUCTION ---
         full_prompt = f"""
         You are 'Kishan', an expert agricultural scientist.
@@ -951,12 +976,41 @@ class ProjectKishan:
         4. CRITICAL: At the end of your answer, list the 'Sources' you used from the Knowledge Base (e.g., 'Source: ICAR Manual').
         5. Keep the answer practical for a farmer.
         """
+
+        # --- 3. ROBUST GENERATION LOOP (The Fix) ---
+        # Ensure we have keys (loaded from initialize_apis)
+        available_keys = getattr(self, 'gemini_keys', [])
         
-        try:
-            response = self.gemini_model.generate_content(full_prompt)
-            return response.text
-        except Exception as e:
-            return f"Error generating response: {str(e)}"
+        if not available_keys:
+            return "Error: No Gemini API keys found. Please check your .env file."
+
+        # Try up to 6 times (switching keys each time)
+        max_retries = len(available_keys) + 2
+        
+        for attempt in range(max_retries):
+            try:
+                # A. Pick a random key & Configure
+                current_key = random.choice(available_keys)
+                genai.configure(api_key=current_key)
+                
+                # B. Initialize Model Just-in-Time (Use Flash for speed/rate limits)
+                model = genai.GenerativeModel('gemini-2.5-flash')
+                
+                # C. Generate
+                response = model.generate_content(full_prompt)
+                return response.text
+
+            except ResourceExhausted:
+                # Rate Limit Hit (429) -> Wait 1s -> Loop again (picking new key)
+                print(f"⚠️ Key ending in ...{current_key[-4:]} exhausted. Switching...")
+                time.sleep(1)
+                continue
+                
+            except Exception as e:
+                # Real Error -> Return immediately
+                return f"AI Generation Error: {str(e)}"
+
+        return "⚠️ System Overload: All API keys are currently busy. Please try again in 30 seconds."
 
 def create_interactive_map(default_lat=28.6139, default_lon=77.2090):
     """Create an interactive map for location selection"""
@@ -1035,47 +1089,47 @@ def main():
         st.session_state.current_location = {"lat": 23.2715, "lon": 87.3095} 
         st.session_state.current_analysis = None
         st.session_state.selected_crop = 'Rice'
-        st.session_state.auto_analyzed = False # Track if we have done the first auto-run
+        st.session_state.auto_analyzed = False 
+        # NEW: Track the last processed audio to prevent loops
+        st.session_state.last_processed_audio_id = None 
 
     Kishan = st.session_state.Kishan
 
-    # --- GEOLOCATION LOGIC (The New Feature) ---
-    # This runs on every refresh. It returns None until the user clicks "Allow".
+    # --- GEOLOCATION LOGIC (Fixed & Safe) ---
     user_loc = get_geolocation(component_key="get_user_location_unique")
 
-    # Check if we have received new coordinates from the browser AND haven't synced yet
-    if user_loc and 'geo_synced' not in st.session_state:
-        new_lat = user_loc['coords']['latitude']
-        new_lon = user_loc['coords']['longitude']
-        
-        # Update State
-        st.session_state.current_location = {"lat": new_lat, "lon": new_lon}
-        st.session_state.geo_synced = True  # Mark as synced so we don't reset it
-        st.session_state.trigger_analysis = True # Flag to force analysis
-        st.rerun() # Refresh the app immediately to show the new location
+    if user_loc:
+        # Check if 'coords' exists safely
+        coords = user_loc.get('coords')
+        if coords:
+            new_lat = coords.get('latitude')
+            new_lon = coords.get('longitude')
+            # Only update if valid and not synced yet
+            if new_lat and new_lon and 'geo_synced' not in st.session_state:
+                st.session_state.current_location = {"lat": new_lat, "lon": new_lon}
+                st.session_state.geo_synced = True 
+                st.session_state.trigger_analysis = True
+                st.rerun()
+        elif 'error' in user_loc:
+            # Silently handle error - keeps the app alive
+            pass
 
     # --- 2. SIDEBAR PART 1 (Language & Title) ---
     with st.sidebar:
-        # A. LANGUAGE SELECTOR
         selected_lang = st.selectbox("🌐 Language / भाषा / ভাষা", ["English", "Hindi", "Bengali"])
         t = TRANSLATIONS[selected_lang]
-        
-        # B. TRANSLATED TITLE
         st.title(t["sidebar_title"])
         st.markdown("---")
 
     # --- 3. MAIN HEADER ---
     st.markdown(f'<div class="main-header">🌱 {t["title"]}</div>', unsafe_allow_html=True)
     st.markdown(f'<p style="text-align: center; font-size: 1.08rem; color: #1a531b; margin-bottom: 0.4rem; margin-top:0.25rem;">{t["tagline"]}</p>', unsafe_allow_html=True)
-
-    # Render multilingual contact information
     contact_html = render_multilingual_contact(t)
     st.markdown(contact_html, unsafe_allow_html=True)
     
-    # --- 4. MAP & ANALYSIS SECTION (FULL WIDTH) ---
+    # --- 4. MAP & ANALYSIS SECTION ---
     st.markdown('<div class="center-wrapper">', unsafe_allow_html=True)
     
-    # Display Interactive Map using state coordinates (Now Dynamic!)
     map_obj = create_interactive_map(
         st.session_state.current_location["lat"],
         st.session_state.current_location["lon"]
@@ -1083,15 +1137,12 @@ def main():
     
     map_data = st_folium(map_obj, width=None, height=420, returned_objects=["last_clicked"])
 
-    # HANDLE MAP CLICKS
     if map_data and map_data.get("last_clicked"):
         clicked_lat = map_data["last_clicked"]["lat"]
         clicked_lng = map_data["last_clicked"]["lng"]
-        
         current_lat = st.session_state.current_location["lat"]
         current_lng = st.session_state.current_location["lon"]
         
-        # Check if new click (tolerance ~11 meters)
         if abs(clicked_lat - current_lat) > 0.0001 or abs(clicked_lng - current_lng) > 0.0001:
             st.session_state.current_location = {"lat": clicked_lat, "lon": clicked_lng}
             st.session_state["lat_input_box"] = clicked_lat
@@ -1106,7 +1157,6 @@ def main():
             st.session_state.current_location["lat"] = st.session_state.lat_input_box
             st.session_state.current_location["lon"] = st.session_state.lon_input_box
 
-        # C. LOCATION INPUTS
         lat_input = st.number_input(
             "📍 Latitude", 
             value=st.session_state.current_location["lat"],
@@ -1122,7 +1172,6 @@ def main():
             on_change=update_location_from_input
         )
 
-        # D. CROP SELECTOR
         available_crops = [
             'Rice', 'Wheat', 'Maize', 'Sugarcane', 'Cotton', 'Coffee', 'Tea', 
             'Soybean', 'Barley', 'Sorghum', 'Millets', 'Pulses', 'Oil Palm',
@@ -1133,7 +1182,6 @@ def main():
         crop_type = st.selectbox(t["select_crop"], available_crops, key="crop_select")
         st.session_state.selected_crop = crop_type
         
-        # E. SYSTEM STATUS
         st.markdown("---")
         def status_icon(is_active): return "🟢" if is_active else "🔴"
         s_col1, s_col2 = st.columns(2)
@@ -1144,26 +1192,22 @@ def main():
             st.write(f"{status_icon(Kishan.api_status['weather'])} Weather")
             st.write(f"{status_icon(Kishan.api_status['gemini'])} Gemini")
 
-    # --- 6. ANALYZE LOGIC (Button OR Auto-Run) ---
+    # --- 6. ANALYZE LOGIC ---
     st.markdown('<div class="center-button">', unsafe_allow_html=True)
 
-    # Check for missing APIs
     required_apis = ['model']
     missing_apis = [api for api in required_apis if not Kishan.api_status[api]]
     analyze_disabled = bool(missing_apis)
     if missing_apis:
         st.error(f"❌ API Error: {', '.join(missing_apis)}")
 
-    # LOGIC: Did user click button? OR Is auto-trigger set?
     user_clicked = st.button(t["analyze_btn"], type="primary", use_container_width=True, disabled=analyze_disabled)
     auto_trigger = st.session_state.get('trigger_analysis', False)
 
-    # If this is the FIRST run and we haven't analyzed yet, do it now (fallback for default location)
     if not st.session_state.auto_analyzed and not st.session_state.current_analysis:
         auto_trigger = True
 
     if (user_clicked or auto_trigger) and not analyze_disabled:
-        # Reset the trigger so it doesn't loop
         st.session_state.trigger_analysis = False 
         st.session_state.auto_analyzed = True
         
@@ -1202,55 +1246,26 @@ def main():
     st.markdown("---")
     tab1, tab2 = st.tabs(["📊 " + t["results_header"], "🤖 " + t["chat_header"]])
     
-    # --- TAB 1: METRICS & CHARTS ---
+    # --- TAB 1: METRICS ---
     with tab1:
         if st.session_state.current_analysis:
             analysis = st.session_state.current_analysis
-            
             st.markdown(f'<div class="sub-header">{t["results_header"]}</div>', unsafe_allow_html=True)
             
-            # Key Metrics Row
             m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-            
-            with m_col1: # NDVI
+            with m_col1:
                 ndvi_color = "🟢" if analysis['ndvi'] > 0.6 else "🟡" if analysis['ndvi'] > 0.3 else "🔴"
-                st.markdown(f"""
-                <div class="metric-card-box bg-ndvi">
-                    <h3>NDVI (Health)</h3>
-                    <h2>{analysis['ndvi']:.2f} {ndvi_color}</h2>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            with m_col2: # YIELD
-                st.markdown(f"""
-                <div class="metric-card-box bg-yield">
-                    <h3>{t['metric_yield']}</h3>
-                    <h2>{analysis['predicted_yield']:.1f}</h2>
-                    <p>tons/ha</p>
-                </div>
-                """, unsafe_allow_html=True)
-
-            with m_col3: # SOIL
+                st.markdown(f"""<div class="metric-card-box bg-ndvi"><h3>NDVI (Health)</h3><h2>{analysis['ndvi']:.2f} {ndvi_color}</h2></div>""", unsafe_allow_html=True)
+            with m_col2:
+                st.markdown(f"""<div class="metric-card-box bg-yield"><h3>{t['metric_yield']}</h3><h2>{analysis['predicted_yield']:.1f}</h2><p>tons/ha</p></div>""", unsafe_allow_html=True)
+            with m_col3:
                 sm_val = analysis['soil_moisture']
                 sm_status_key = "status_optimal" if 20 <= sm_val <= 60 else "status_dry" if sm_val < 20 else "status_wet"
                 sm_status_text = t.get(sm_status_key, "Unknown")
-                st.markdown(f"""
-                <div class="metric-card-box bg-moisture">
-                    <h3>{t['metric_soil']}</h3>
-                    <h2>{sm_val:.1f}%</h2>
-                    <p>{sm_status_text}</p>
-                </div>
-                """, unsafe_allow_html=True)
-
-            with m_col4: # RAIN
-                st.markdown(f"""
-                <div class="metric-card-box bg-rain">
-                    <h3>{t['metric_rain']}</h3>
-                    <h2>{analysis['total_precipitation']:.1f}mm</h2>
-                </div>
-                """, unsafe_allow_html=True)
+                st.markdown(f"""<div class="metric-card-box bg-moisture"><h3>{t['metric_soil']}</h3><h2>{sm_val:.1f}%</h2><p>{sm_status_text}</p></div>""", unsafe_allow_html=True)
+            with m_col4:
+                st.markdown(f"""<div class="metric-card-box bg-rain"><h3>{t['metric_rain']}</h3><h2>{analysis['total_precipitation']:.1f}mm</h2></div>""", unsafe_allow_html=True)
             
-            # Detailed Analysis Section
             col1, col2 = st.columns(2)
             with col1:
                 st.markdown('<div class="section-header">🌱 Vegetation Indices</div>', unsafe_allow_html=True)
@@ -1268,9 +1283,6 @@ def main():
                     weather_display.columns = ['Day', 'Date', 'Temp (°C)', 'Rain (mm)', 'Conditions']
                     st.dataframe(weather_display, use_container_width=True, hide_index=True)
 
-            # Auto-Generated Insight
-            st.markdown(f'<div class="section-header">🤖 {t["chat_header"]} Insights</div>', unsafe_allow_html=True)
-            
             if Kishan.api_status['gemini']:
                 insight_key = f"insight_{analysis['latitude']}_{analysis['crop_type']}_{selected_lang}_{analysis['analysis_date']}"
                 if insight_key not in st.session_state: 
@@ -1283,7 +1295,7 @@ def main():
             else:
                 st.warning("AI Insights unavailable (Gemini API offline)")
 
-    # --- TAB 2: AI CHAT (VOICE ENABLED) ---
+    # --- TAB 2: AI CHAT (FIXED LOOP) ---
     with tab2:
         st.subheader(t["chat_header"])
         
@@ -1292,7 +1304,6 @@ def main():
         else:
             # 1. Display Chat History
             for message in st.session_state.chat_history:
-                role_display = "👤 You" if message['role'] == 'user' else f"🤖 {t['title']}"
                 with st.chat_message(message['role']):
                     st.write(message['content'])
                     if message.get('audio'):
@@ -1315,16 +1326,24 @@ def main():
             # 3. Handle Voice Input OR Text Input
             user_text = None
             
+            # --- LOOP FIX: Check if this exact audio was already processed ---
+            is_new_audio = False
             if audio_input and audio_input['bytes']:
-                transcribed_text = recognize_audio(audio_input['bytes'], selected_lang)
-                if transcribed_text:
-                    user_text = transcribed_text
+                if audio_input['id'] != st.session_state.last_processed_audio_id:
+                    transcribed_text = recognize_audio(audio_input['bytes'], selected_lang)
+                    if transcribed_text:
+                        user_text = transcribed_text
+                        is_new_audio = True
+                        # Mark this audio ID as processed so we don't do it again next rerun
+                        st.session_state.last_processed_audio_id = audio_input['id']
 
+            # Text input (Chat box)
             if prompt := st.chat_input(t["chat_placeholder"]):
                 user_text = prompt
+                is_new_audio = True # Text is always new when submitted
 
-            # 4. Process Input
-            if user_text:
+            # 4. Process Input (ONLY if it's new)
+            if user_text and is_new_audio:
                 st.session_state.chat_history.append({'role': 'user', 'content': user_text})
                 st.chat_message("user").write(user_text)
                 
@@ -1349,7 +1368,8 @@ def main():
                             st.write(ai_response_text)
                             if audio_response:
                                 st.audio(audio_response, format='audio/mp3', start_time=0)
-
+                        
+                        # Force refresh to show message permanently
                         st.rerun()
                             
                     except Exception as e:
